@@ -1,6 +1,7 @@
 import os
 import glob
 import shutil
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
@@ -9,9 +10,9 @@ from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
 from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate  # NOVO: Para criar o prompt personalizado
+from langchain.prompts import PromptTemplate
 
-# --- Força a desativação da telemetria (caso ainda tenha resquícios do Chroma) ---
+# --- Força a desativação da telemetria ---
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 os.environ["CHROMA_TELEMETRY_IMPL"] = "none"
 
@@ -25,8 +26,8 @@ LLM_MODEL = "llama3.2"  # Pode trocar por "mistral" ou "phi3" se quiser
 
 # --- 2. Inicialização do FastAPI ---
 app = FastAPI(
-    title="Manual TDM com IA",
-    description="Faça perguntas sobre a ferrmenta TDM",
+    title="Assistente TDM com IA",
+    description="Faça perguntas sobre a ferramenta TDM (Test Data Management)",
     version="1.0"
 )
 
@@ -96,25 +97,24 @@ if os.path.exists(FAISS_INDEX_DIR):
 if vectorstore is None:
     vectorstore = load_and_index_pdfs()
 
-# --- 5. Configura a chain com prompt personalizado (MELHORIA) ---
+# --- 5. Configura a chain com prompt personalizado ---
 qa_chain = None
 if vectorstore:
     print("🧠 Configurando o modelo de linguagem...")
     llm = Ollama(
         model=LLM_MODEL,
         base_url=OLLAMA_URL,
-        temperature=0.2,   # Menor temperatura = mais preciso, menos criativo
+        temperature=0.2,
         num_predict=512
     )
 
-    # Prompt personalizado que OBRIGA o modelo a usar o contexto
     template = """
     Você é um especialista técnico em manuais de software.
-            Responda perguntas sobre a ferramenta TDM (Test Data Management) com base APENAS no contexto fornecido.
-            Forneça respostas técnicas, claras, objetivas e em português.
-            Se a informação não estiver no contexto, responda: "Não encontrei essa informação na documentação fornecida."
-            Se for uma lista, formate em tópicos numerados.
-            Se a pergunta pedir um passo a passo, descreva o processo de forma lógica.
+    Responda perguntas sobre a ferramenta TDM (Test Data Management) com base APENAS no contexto fornecido.
+    Forneça respostas técnicas, claras, objetivas e em português.
+    Se a informação não estiver no contexto, responda: "Não encontrei essa informação na documentação fornecida."
+    Se for uma lista, formate em tópicos numerados.
+    Se a pergunta pedir um passo a passo, descreva o processo de forma lógica.
 
     Contexto:
     {context}
@@ -127,9 +127,7 @@ if vectorstore:
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vectorstore.as_retriever(
-            search_kwargs={"k": 15}   # Aumentado de 4 para 6 pedaços (pega mais contexto)
-        ),
+        retriever=vectorstore.as_retriever(search_kwargs={"k": 15}),
         return_source_documents=False,
         chain_type_kwargs={"prompt": PROMPT}
     )
@@ -148,47 +146,43 @@ async def ask_question(question: Question):
         raise HTTPException(503, detail="Sistema não inicializado.")
     
     pergunta_original = question.pergunta
-    import re
     
-    # 1. Extrai o ano
+    # 1. Extrai o ano (se houver)
     ano_match = re.search(r'\b(20\d{2})\b', pergunta_original)
     ano = ano_match.group() if ano_match else None
     
     try:
-        # 2. Primeiro, faz a busca normalmente para pegar os chunks (usando o retriever do qa_chain)
-        # Nota: precisamos acessar o retriever diretamente
-        docs = vectorstore.similarity_search(pergunta_original, k=20)  # Busca 20 chunks
+        docs = vectorstore.similarity_search(pergunta_original, k=20)
         
-        # 3. Se tiver ano, FILTRA os chunks pela fonte (nome do arquivo)
+        # 2. Se tiver ano, FILTRA os chunks pela fonte
         if ano:
             chunks_filtrados = []
             for doc in docs:
                 fonte = doc.metadata.get("source", "")
-                # Verifica se o ano está no nome do arquivo (ex: extrato_202607.pdf)
                 if ano in fonte:
                     chunks_filtrados.append(doc)
             
-            # Se não sobrou nenhum chunk do ano específico, avisa
             if not chunks_filtrados:
                 return {
                     "pergunta": pergunta_original,
-                    "resposta": f"Não encontrei transações do ano {ano} nos extratos.",
+                    "resposta": f"Não encontrei documentos do ano {ano} na base.",
                     "filtro_aplicado": f"ano {ano} (nenhum chunk encontrado)"
                 }
             
-            # 4. Se encontrou chunks filtrados, usamos eles para gerar a resposta
-            # Prepara o contexto manualmente
             context = "\n\n".join([doc.page_content for doc in chunks_filtrados])
             
-            # Chama o LLM diretamente com o contexto filtrado
             llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0.2)
             prompt_final = f"""
-            Você é um assistente financeiro. Responda APENAS com base no contexto abaixo.
+            Você é um especialista técnico em manuais de software.
+            Responda perguntas sobre a ferramenta TDM com base APENAS no contexto abaixo.
+            Forneça respostas técnicas, claras e objetivas.
+            Se a informação não estiver no contexto, responda: "Não encontrei essa informação na documentação fornecida."
+
             Contexto:
             {context}
             
             Pergunta: {pergunta_original}
-            Resposta (liste os valores encontrados):"""
+            Resposta:"""
             
             resposta = llm.invoke(prompt_final)
             
@@ -205,17 +199,17 @@ async def ask_question(question: Question):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao processar: {str(e)}")
+
 # --- 8. Endpoint de saúde ---
 @app.get("/")
 async def root():
-    return {"status": "online", "mensagem": "Envie uma pergunta para /ask com JSON: {'pergunta': 'texto'}"}
+    return {"status": "online", "mensagem": "Assistente TDM pronto para perguntas."}
 
-# --- 9. Endpoint para recarregar os PDFs (com limpeza do índice antigo) ---
+# --- 9. Endpoint para recarregar os PDFs ---
 @app.post("/reload")
 async def reload_pdfs():
     global vectorstore, qa_chain
     
-    # Remove o índice antigo para forçar recriação
     if os.path.exists(FAISS_INDEX_DIR):
         shutil.rmtree(FAISS_INDEX_DIR)
         print("🗑️ Índice FAISS antigo removido.")
@@ -224,47 +218,39 @@ async def reload_pdfs():
     if vectorstore:
         llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0.2)
         
-        # Reconstrói o prompt personalizado também no reload
         template = """
-             Você é um assistente financeiro especializado em extratos bancários.
+        Você é um especialista técnico em manuais de software.
+        Responda perguntas sobre a ferramenta TDM com base APENAS no contexto fornecido.
+        Forneça respostas técnicas, claras e objetivas.
+        Se a informação não estiver no contexto, responda: "Não encontrei essa informação na documentação fornecida."
 
-            INSTRUÇÕES OBRIGATÓRIAS:
-            1. Responda APENAS com base no contexto fornecido abaixo.
-            2. Se a pergunta pedir uma lista (ex: "liste os valores"), forneça a lista em tópicos numerados.
-            3. Se houver múltiplas ocorrências, liste todas que encontrar.
-            4. Se não encontrar a informação, responda exatamente: "Não encontrei essa informação nos extratos."
-            5. NÃO invente valores nem informações.
+        Contexto:
+        {context}
 
-            Contexto:
-            {context}
-
-            Pergunta: {question}
-            Resposta (seja específico e liste os valores encontrados):"""
+        Pergunta: {question}
+        Resposta:"""
+        
         PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
         
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 6}),
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 15}),
             return_source_documents=False,
             chain_type_kwargs={"prompt": PROMPT}
         )
-        return {"status": "success", "message": "PDFs recarregados com sucesso!"}
+        return {"status": "success", "message": "Documentos recarregados com sucesso!"}
     else:
         qa_chain = None
         return {"status": "error", "message": "Nenhum PDF encontrado."}
-# --- 10. Endpoint de Debug (para inspecionar a busca) ---
+
+# --- 10. Endpoint de Debug ---
 @app.post("/debug/search")
 async def debug_search(question: Question):
-    """
-    Endpoint de debug: retorna os chunks recuperados para uma pergunta.
-    Útil para ver o que o sistema está encontrando antes de gerar a resposta.
-    """
     if not vectorstore:
         raise HTTPException(503, detail="Vectorstore não inicializado.")
     
-    # Realiza a busca semântica
-    docs = vectorstore.similarity_search(question.pergunta, k=15)  # mesmo k usado na chain
+    docs = vectorstore.similarity_search(question.pergunta, k=15)
     
     return {
         "pergunta": question.pergunta,
